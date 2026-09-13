@@ -1,0 +1,321 @@
+diff --git a/agent/chat_completion_helpers.py b/agent/chat_completion_helpers.py
+index 7af486dc5bb826bc544cab5a7af38d034ae8152b..cfce453eb12e9f7a4d7128c6fda14487441366b6 100644
+--- a/agent/chat_completion_helpers.py
++++ b/agent/chat_completion_helpers.py
+@@ -4031,7 +4031,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
+                     agent._fire_stream_delta(text)
+                     deltas_were_sent["yes"] = True
+                 return
+-            if agent.stream_delta_callback:
++            if agent.stream_delta_callback and not getattr(agent, "_plugin_buffer_output", False):
+                 for text in pending_parts:
+                     try:
+                         agent.stream_delta_callback(text)
+@@ -4169,7 +4169,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
+                 # reasoning display.  Non-reasoning text is harmlessly
+                 # suppressed by the CLI's _stream_delta when the stream
+                 # box is already closed (tool boundary flush).
+-                elif agent.stream_delta_callback:
++                elif agent.stream_delta_callback and not getattr(agent, "_plugin_buffer_output", False):
+                     try:
+                         agent.stream_delta_callback(delta_content)
+                         agent._record_streamed_assistant_text(delta_content)
+diff --git a/agent/conversation_loop.py b/agent/conversation_loop.py
+index 2d49501518e91aaf2779d9198a62f23635d1c7bb..331893fd81720002c1ef8155277b3108cfd7ad62 100644
+--- a/agent/conversation_loop.py
++++ b/agent/conversation_loop.py
+@@ -7354,7 +7354,7 @@ def run_conversation(
+                     # was flushed (callback(None)) before tool execution,
+                     # but the callback is still alive — fire the text
+                     # through it so SSE/TUI clients see the explanation.
+-                    if final_response:
++                    if final_response and not getattr(agent, "_plugin_buffer_output", False):
+                         agent._safe_print(f"\n{final_response}\n")
+                         if agent.stream_delta_callback:
+                             try:
+@@ -8174,7 +8174,7 @@ def run_conversation(
+                     from hermes_cli.lifecycle import has_hook
+                     from hermes_cli.plugins import get_pre_verify_continue_message
+ 
+-                    if _edited and has_hook("pre_verify") and _attempt < max_verify_nudges():
++                    if (_edited or getattr(agent, "_plugin_verify_on_stop", False)) and has_hook("pre_verify") and _attempt < max_verify_nudges():
+                         # Posture is fixed for the session — resolve once + cache.
+                         coding = getattr(agent, "_resolved_is_coding", None)
+                         if coding is None:
+diff --git a/agent/plugin_completion_policy.py b/agent/plugin_completion_policy.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..e8438c5d1c6b85e340e82c4fec27f586344c7abc
+--- /dev/null
++++ b/agent/plugin_completion_policy.py
+@@ -0,0 +1,52 @@
++"""Opt-in native plugin completion policy; no policy when hooks are absent.
++
++Pre-LLM hooks may request buffered delivery and non-coding verification.
++Completion gates run after cosmetic transforms and fail closed if a policy
++was requested but its gate disappears. No system prompt/toolset is mutated.
++"""
++from __future__ import annotations
++
++
++def available_policy_tools(agent):
++    """Include session-scoped deferred capabilities without changing model tools."""
++    visible = list(getattr(agent, "tools", None) or [])
++    names = {s.get("function", s).get("name") for s in visible}
++    if "tool_call" in names:
++        from agent.tool_executor import _tool_search_scoped_names
++        from tools.registry import registry
++        for name in sorted(_tool_search_scoped_names(agent) - names):
++            entry = registry.get_entry(name)
++            if entry is not None:
++                visible.append({"type": "function", "function": entry.schema})
++    return visible
++
++
++def set_turn_policy(agent, results):
++    agent._plugin_buffer_output = False
++    agent._plugin_verify_on_stop = False
++    agent._plugin_completion_required = False
++    for result in results:
++        policy = result.get("completion_policy") if isinstance(result, dict) else None
++        if not isinstance(policy, dict):
++            continue
++        agent._plugin_buffer_output |= policy.get("buffer_output") is True
++        agent._plugin_verify_on_stop |= policy.get("verify_on_stop") is True
++        agent._plugin_completion_required |= policy.get("required") is True
++
++
++def completion_decision(agent, text):
++    if getattr(agent, "_plugin_completion_required", False) is not True:
++        return None
++    from hermes_cli.lifecycle import invoke_hook
++    results = invoke_hook("completion_gate", session_id=agent.session_id or "",
++                          response_text=text or "", platform=getattr(agent, "platform", "") or "")
++    valid = [r for r in results if isinstance(r, dict) and isinstance(r.get("verified"), bool)]
++    # Any veto wins, even if a different plugin approves the answer.
++    veto = next((r for r in valid if not r["verified"]), None)
++    if veto:
++        return {"verified": False, "response_text": veto.get("response_text") or
++                "BLOCKED: completion policy did not verify the objective."}
++    if valid:
++        return {"verified": True, "response_text": text}
++    return {"verified": False, "response_text":
++            "BLOCKED: required completion policy is unavailable; no verified completion."}
+diff --git a/agent/turn_context.py b/agent/turn_context.py
+index f9bc38f126bf536609941c267900e73a18b77600..93b6f8b9dbcb69f0ba0ec1050d59518e0f4e0aef 100644
+--- a/agent/turn_context.py
++++ b/agent/turn_context.py
+@@ -1243,6 +1243,8 @@ def build_turn_context(
+ 
+     # Plugin hook: pre_llm_call (context injected into user message, not system prompt).
+     plugin_user_context = ""
++    from agent.plugin_completion_policy import available_policy_tools, set_turn_policy
++    set_turn_policy(agent, [])
+     try:
+         from hermes_cli.lifecycle import invoke_hook as _invoke_hook
+         _pre_results = _invoke_hook(
+@@ -1257,7 +1259,9 @@ def build_turn_context(
+             platform=getattr(agent, "platform", None) or "",
+             parent_session_id=getattr(agent, "_parent_session_id", None) or "",
+             sender_id=getattr(agent, "_user_id", None) or "",
++            available_tools=available_policy_tools(agent),
+         )
++        set_turn_policy(agent, _pre_results)
+         _ctx_parts: list[str] = []
+         # Spill oversized per-hook context to disk so a runaway plugin
+         # can't inflate every subsequent turn's prompt. Ported from
+diff --git a/agent/turn_finalizer.py b/agent/turn_finalizer.py
+index e3b20d876e435aab9eb9a78124bc078dc38e3c3b..91891977272f861526c84fad16a100fcefa90b22 100644
+--- a/agent/turn_finalizer.py
++++ b/agent/turn_finalizer.py
+@@ -224,9 +224,26 @@ def finalize_turn(
+             )
+ 
+     # Determine if conversation completed successfully
++    # Gate the current, undelivered final candidate before durable storage.
++    # Earlier tool observations remain untouched; only this terminal candidate
++    # is replaced, so future sessions cannot inherit an unsupported "done".
++    from agent.plugin_completion_policy import completion_decision
++    try:
++        _initial_completion = completion_decision(agent, final_response)
++    except Exception:
++        _initial_completion = {"verified": False, "response_text":
++                               "BLOCKED: completion verification failed; objective unverified."}
++    if _initial_completion is not None and not _initial_completion["verified"]:
++        final_response = _initial_completion["response_text"]
++        if messages and messages[-1].get("role") == "assistant" and not messages[-1].get("tool_calls"):
++            messages[-1]["content"] = final_response
++            messages[-1].pop("_db_persisted", None)
++        _turn_exit_reason = "completion_policy_blocked"
++        agent._response_was_previewed = False
+     normal_text_response = str(_turn_exit_reason).startswith("text_response(")
+     completed = (
+         final_response is not None
++        and not (_initial_completion is not None and not _initial_completion["verified"])
+         and not failed
+         and (
+             api_call_count < agent.max_iterations
+@@ -613,6 +630,23 @@ def finalize_turn(
+         except Exception as exc:
+             logger.warning("transform_llm_output hook failed: %s", exc)
+ 
++    # Required completion policy runs after cosmetic transformations. A tool
++    # turn ending is distinct from its objective being verified.
++    from agent.plugin_completion_policy import completion_decision
++    try:
++        _completion = completion_decision(agent, final_response)
++    except Exception:
++        _completion = {"verified": False, "response_text":
++                       "BLOCKED: completion verification failed; objective unverified."}
++    if _completion is not None:
++        if not _completion["verified"]:
++            _pre_transform_response = None  # do not return rejected text to UIs
++            final_response = _completion["response_text"]
++            _response_transformed = True
++            completed = False
++            _turn_exit_reason = "completion_policy_blocked"
++        agent._response_was_previewed = False
++
+     # Plugin hook: post_llm_call
+     # Fired once per turn after the tool-calling loop completes.
+     # Plugins can use this to persist conversation data (e.g. sync
+@@ -727,6 +761,8 @@ def finalize_turn(
+         ).get("service_tier"),
+         "session_id": agent.session_id,
+     }
++    if _completion is not None:
++        result["objective_verified"] = _completion["verified"]
+     if agent._tool_guardrail_halt_decision is not None:
+         result["guardrail"] = agent._tool_guardrail_halt_decision.to_metadata()
+     # Persistence failures already set failed=True + an explanation in
+diff --git a/hermes_cli/plugins.py b/hermes_cli/plugins.py
+index 2493d8f21eddc0617d04e9ee48812846086eade4..75e2463b900346b578d90a1b3167c361e1a1a1d1 100644
+--- a/hermes_cli/plugins.py
++++ b/hermes_cli/plugins.py
+@@ -159,6 +159,7 @@ _install_plugin_debug_handler()
+ # ---------------------------------------------------------------------------
+ 
+ VALID_HOOKS: Set[str] = {
++    "completion_gate",  # opt-in final objective verification; any veto wins
+     "pre_tool_call",
+     "post_tool_call",
+     "transform_terminal_output",
+diff --git a/run_agent.py b/run_agent.py
+index 5da066ab183bec555a1af4085b4cb7b089187e5c..1b594d4b6ee628049266d610b604366f8ad61069 100644
+--- a/run_agent.py
++++ b/run_agent.py
+@@ -6742,6 +6742,8 @@ class AIAgent:
+ 
+     def _fire_streamed_codex_commentary(self, text: str) -> None:
+         """Deliver a completed live Codex commentary message immediately."""
++        if getattr(self, "_plugin_buffer_output", False):
++            return
+         cb = getattr(self, "interim_assistant_callback", None)
+         if cb is None or not isinstance(text, str):
+             return
+@@ -6769,6 +6771,8 @@ class AIAgent:
+         when the only streamed text was unrelated mid-turn commentary. (#65919
+         review: response-loss blocker)
+         """
++        if getattr(self, "_plugin_buffer_output", False):
++            return
+         if not isinstance(assistant_msg, dict):
+             return
+         commentary_parts = self._extract_codex_interim_visible_parts(assistant_msg)
+@@ -6934,6 +6938,8 @@ class AIAgent:
+ 
+     def _fire_stream_delta(self, text: str) -> None:
+         """Fire all registered stream delta callbacks (display + TTS)."""
++        if getattr(self, "_plugin_buffer_output", False):
++            return
+         # Single-writer guard (#65991): a superseded stream must not interleave
+         # its tokens into the turn alongside the retry that replaced it.
+         if self._stream_writer_superseded():
+diff --git a/tests/agent/test_governor_stream_buffer.py b/tests/agent/test_governor_stream_buffer.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..03bc1bf58be9b51c560982d752b51bfdecbdbc80
+--- /dev/null
++++ b/tests/agent/test_governor_stream_buffer.py
+@@ -0,0 +1,46 @@
++"""Required completion policy must cover real streaming dispatch paths."""
++from types import SimpleNamespace
++from unittest.mock import MagicMock, patch
++
++import pytest
++
++
++def chunk(content=None, tools=None, finish=None):
++    delta = SimpleNamespace(content=content, tool_calls=tools, reasoning_content=None, reasoning=None)
++    return SimpleNamespace(choices=[SimpleNamespace(index=0, delta=delta, finish_reason=finish)], model="test/model", usage=None)
++
++
++@pytest.mark.parametrize("buffered", [True, False])
++@pytest.mark.parametrize("claim", ["done", "fixed", "deployed", "sent", "working", "successful"])
++@pytest.mark.parametrize("with_tool", [True, False])
++def test_provider_stream_claims_are_buffered(buffered, claim, with_tool):
++    from run_agent import AIAgent
++
++    tool = SimpleNamespace(index=0, id="call1", function=SimpleNamespace(name="read_file", arguments='{"path":"fixture"}'))
++    chunks = ([chunk(tools=[tool])] if with_tool else []) + [chunk(content=claim), chunk(finish="tool_calls" if with_tool else "stop")]
++    client = MagicMock()
++    client.chat.completions.create.return_value = iter(chunks)
++    with patch.object(AIAgent, "_create_request_openai_client", return_value=client), patch.object(AIAgent, "_close_request_openai_client"):
++        agent = AIAgent(api_key="test-key", provider="openrouter", base_url="https://openrouter.ai/api/v1", model="test/model", quiet_mode=True, skip_context_files=True, skip_memory=True)
++        agent.api_mode = "chat_completions"
++        agent._plugin_buffer_output = buffered
++        visible = []
++        agent.stream_delta_callback = visible.append
++        response = agent._interruptible_streaming_api_call({})
++        assert response.choices[0].message.content == claim
++        assert (claim not in visible) if buffered else (claim in visible)
++
++
++@pytest.mark.parametrize("claim", ["done", "fixed", "deployed", "sent", "working", "successful"])
++def test_codex_and_interim_claims_are_buffered(claim):
++    from run_agent import AIAgent
++
++    agent = AIAgent(api_key="test-key", provider="openrouter", base_url="https://openrouter.ai/api/v1", model="test/model", quiet_mode=True, skip_context_files=True, skip_memory=True)
++    agent._plugin_buffer_output = True
++    visible = []
++    agent.stream_delta_callback = visible.append
++    agent.interim_assistant_callback = lambda *a, **kw: visible.append(a)
++    agent._fire_streamed_codex_commentary(claim)
++    agent._emit_interim_assistant_message({"content": claim})
++    agent._fire_stream_delta(claim)
++    assert not visible
+diff --git a/tests/agent/test_plugin_completion_policy.py b/tests/agent/test_plugin_completion_policy.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..9b5813e1e7fa33c4f641cd45f17e177ff613d583
+--- /dev/null
++++ b/tests/agent/test_plugin_completion_policy.py
+@@ -0,0 +1,31 @@
++from types import SimpleNamespace
++
++from agent.plugin_completion_policy import completion_decision, set_turn_policy
++
++
++def test_default_is_no_policy():
++    agent=SimpleNamespace()
++    set_turn_policy(agent, [])
++    assert completion_decision(agent, "Hello") is None
++
++
++def test_any_veto_wins(monkeypatch):
++    agent=SimpleNamespace(session_id="test")
++    set_turn_policy(agent,[{"completion_policy":{"required":True}}])
++    monkeypatch.setattr("hermes_cli.lifecycle.invoke_hook", lambda *a,**kw:[{"verified":True},{"verified":False,"response_text":"Needs evidence"}])
++    assert completion_decision(agent,"Done")=={"verified":False,"response_text":"Needs evidence"}
++
++
++def test_missing_required_gate_blocks(monkeypatch):
++    agent=SimpleNamespace(session_id="test")
++    set_turn_policy(agent,[{"completion_policy":{"required":True}}])
++    monkeypatch.setattr("hermes_cli.lifecycle.invoke_hook",lambda *a,**kw:[])
++    assert completion_decision(agent,"Done")["verified"] is False
++
++
++def test_flags_reset_and_require_literal_booleans():
++    agent=SimpleNamespace()
++    set_turn_policy(agent,[{"completion_policy":{"required":True,"buffer_output":True}}])
++    assert agent._plugin_buffer_output
++    set_turn_policy(agent,[{"completion_policy":{"required":"true"}}])
++    assert not agent._plugin_buffer_output and not agent._plugin_completion_required

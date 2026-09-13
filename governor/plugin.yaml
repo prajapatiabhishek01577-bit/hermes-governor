@@ -1,0 +1,10 @@
+name: hermes-governor
+version: "1.0.0"
+description: "Objective planning, capability discovery, permission gates, observed evidence and verified completion."
+author: Local owner
+hooks:
+  - pre_llm_call
+  - pre_tool_call
+  - post_tool_call
+  - pre_verify
+  - completion_gate

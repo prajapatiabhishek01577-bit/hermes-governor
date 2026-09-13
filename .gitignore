@@ -1,0 +1,31 @@
+# Credentials and machine state — never publish these.
+.env
+.env.*
+auth.json
+**/auth.json
+*.token
+*.key
+*.pem
+*.p12
+*.pfx
+credentials*
+cookies*
+
+# Python, test and editor state
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+.coverage
+htmlcov/
+
+# Hermes runtime data and local evidence
+plugin-data/
+state.db
+*.db
+*.log
+*.tmp
+*.bak
+*.backup
+hermes-governor-portable.index*
